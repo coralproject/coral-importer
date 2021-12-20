@@ -321,7 +321,7 @@ type UserNotifications struct {
 type UserMetadata struct {
 	Notifications       *UserNotifications `json:"notifications"`
 	LastAccountDownload *coral.Time        `json:"lastAccountDownload"`
-	DisplayName         string             `json:displayName`
+	DisplayName         string             `json:"displayName"`
 }
 
 type User struct {
