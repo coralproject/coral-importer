@@ -404,12 +404,8 @@ func TranslateUser(tenantID string, in *User) *coral.User {
 	user := coral.NewUser(tenantID)
 	user.ID = in.ID
 	// Handle metadata.displayName resolvers
-	if in.Metadata.DisplayName != nil {
-		if in.Metadata.DisplayName != "" {
-			user.Username = *in.Metadata.DisplayName
-		} else {
-			user.Username = in.Username
-		}
+	if in.Metadata.DisplayName != "" {
+		user.Username = in.Metadata.DisplayName
 	} else {
 		user.Username = in.Username
 	}
