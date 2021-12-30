@@ -438,7 +438,7 @@ func TranslateUser(tenantID string, in *User) *coral.User {
 			user.Status.SuspensionStatus.History[i].CreatedBy = *history.AssignedBy
 		}
 	}
-	//set user.username for username status history, final username be overridden if a metadata.displayName value is present
+	//set user.username for username status history, if a metadata.displayName value is present this will be overwritten 
 	user.Username = in.Username
 	user.Status.BanStatus.Active = in.Status.Banned.Status
 	user.Status.BanStatus.History = make([]coral.UserBanStatusHistory, len(in.Status.Banned.History))
