@@ -34,7 +34,7 @@ func (t *Time) UnmarshalJSON(data []byte) error {
 		date, ok := v["$date"].(string)
 		if !ok || date == "" {
 			// Try to handle the case where we get something that looks like
-			// this: {"$date":-62075098782000}
+			// this: {"$date":{"$numberLong":-62075098782000"}
 			if _, ok := v["$date"].(map[string]float64); ok {
 				logrus.Warn("saw a date in the format: { $date: -62075098782000 }")
 
