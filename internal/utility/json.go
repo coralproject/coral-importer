@@ -2,6 +2,7 @@ package utility
 
 import (
 	"bufio"
+	"io"
 	"os"
 
 	"github.com/mailru/easyjson"
@@ -46,6 +47,44 @@ func (c *JSONWriter) Close() error {
 
 	if err := c.f.Close(); err != nil {
 		return errors.Wrap(err, "could not close file")
+	}
+
+	return nil
+}
+
+type JSONReaderFn func(line int, data []byte) error
+
+func ReadJSON(fileName string, fn JSONReaderFn) error {
+	f, err := os.Open(fileName)
+	if err != nil {
+		return errors.Wrap(err, "could not open file for reading")
+	}
+	defer f.Close()
+
+	// Setup the scanner.
+	r := bufio.NewReader(f)
+
+	// Keep track of the processed lines.
+	lines := 0
+
+	// Start reading the stories line by line from the file.
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+
+			return errors.Wrap(err, "couldn't read the line")
+		}
+
+		// Increment the line count.
+		lines++
+
+		// Send the input to a processor.
+		if err := fn(lines, []byte(line)); err != nil {
+			return errors.Wrap(err, "could not operate on the line")
+		}
 	}
 
 	return nil

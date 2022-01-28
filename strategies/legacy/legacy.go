@@ -8,7 +8,7 @@ import (
 
 	"github.com/coralproject/coral-importer/common"
 	"github.com/coralproject/coral-importer/common/coral"
-	"github.com/coralproject/coral-importer/common/pipeline"
+	"github.com/coralproject/coral-importer/internal/utility"
 	easyjson "github.com/mailru/easyjson"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -38,6 +38,22 @@ func validateCollectionFilesExist(input string) error {
 	}
 
 	return nil
+}
+
+type CommentRef struct {
+	Status       string
+	StoryID      string
+	ParentID     string
+	ActionCounts map[string]int
+}
+
+type StoryRef struct {
+	ActionCounts map[string]int
+	StatusCounts coral.CommentStatusCounts
+}
+
+type UserRef struct {
+	StatusCounts coral.CommentStatusCounts
 }
 
 // Import will handle a data import task for importing comments into Coral from
@@ -73,197 +89,211 @@ func Import(c *cli.Context) error {
 	actionsFileName := filepath.Join(input, "actions.json")
 	commentsFileName := filepath.Join(input, "comments.json")
 
-	commentMap, err := pipeline.NewMapAggregator(
-		pipeline.MergeTaskAggregatorOutputPipelines(
-			pipeline.FanAggregatingProcessor(
-				pipeline.NewJSONFileReader(commentsFileName),
-				ProcessCommentMap(),
-			),
-		),
-	)
-	if err != nil {
-		return errors.Wrap(err, "could not process comments")
+	comments := make(map[string]*CommentRef)
+	if err := utility.ReadJSON(commentsFileName, func(line int, data []byte) error {
+		var in Comment
+		if err := easyjson.Unmarshal(data, &in); err != nil {
+			logrus.WithField("line", line).Error(err)
+
+			return errors.Wrap(err, "could not parse a comment")
+		}
+
+		// Check the input to ensure we're validated.
+		if err := common.Check(&in); err != nil {
+			logrus.WithError(err).WithField("line", line).Warn("validation failed for input user")
+
+			return nil
+		}
+
+		ref := &CommentRef{
+			Status:       TranslateCommentStatus(in.Status),
+			StoryID:      in.AssetID,
+			ActionCounts: map[string]int{},
+		}
+
+		if in.ParentID != nil {
+			ref.ParentID = *in.ParentID
+		}
+
+		comments[in.ID] = ref
+
+		return nil
+	}); err != nil {
+		return errors.Wrap(err, "could not process comment map")
 	}
 
-	logrus.WithField("comments", len(commentMap["storyID"])).WithField("children", len(commentMap["parentID"])).Debug("finished loading comments into map")
+	logrus.WithField("comments", len(comments)).Debug("finished loading comments into map")
 
-	// Write out all the commentActions to ${output}/commentActions.json.
-	if err := pipeline.NewFileWriter(
-		output,
-		pipeline.MergeTaskWriterOutputPipelines(
-			pipeline.FanWritingProcessors(
-				pipeline.NewJSONFileReader(actionsFileName),
-				ProcessCommentActions(tenantID, siteID, commentMap["storyID"]),
-			),
-		),
-	); err != nil {
+	commentActionsOutputFilename := filepath.Join(output, "commentActions.json")
+	commentActionsWriter, err := utility.NewJSONWriter(commentActionsOutputFilename)
+	if err != nil {
+		return errors.Wrap(err, "could not create commentActionsWriter")
+	}
+	defer commentActionsWriter.Close()
+
+	stories := make(map[string]*StoryRef)
+	if err := utility.ReadJSON(actionsFileName, func(line int, data []byte) error {
+		// Parse the Action from the file.
+		var in Action
+		if err := easyjson.Unmarshal(data, &in); err != nil {
+			logrus.WithField("line", line).Error(err)
+
+			return errors.Wrap(err, "could not parse an action")
+		}
+
+		// Ignore the action if it's not a comment action.
+		if in.ItemType != "COMMENTS" {
+			logrus.WithField("line", line).Warn("skipping non-comment flag")
+
+			return nil
+		}
+
+		// Check the input to ensure we're validated.
+		if err := common.Check(&in); err != nil {
+			return errors.Wrap(err, "checking failed input Action")
+		}
+
+		// Translate the action to a comment action.
+		action := TranslateCommentAction(tenantID, siteID, &in)
+		ref, ok := comments[action.CommentID]
+		if !ok {
+			return nil
+		}
+		action.StoryID = ref.StoryID
+
+		if err := commentActionsWriter.Write(action); err != nil {
+			return errors.Wrap(err, "couldn't write out commentAction")
+		}
+
+		story, ok := stories[ref.StoryID]
+		if !ok {
+			story = &StoryRef{
+				ActionCounts: map[string]int{},
+			}
+			stories[ref.StoryID] = story
+		}
+
+		ref.ActionCounts[action.ActionType]++
+		story.ActionCounts[action.ActionType]++
+		if action.ActionType == "FLAG" {
+			ref.ActionCounts[action.ActionType+"__"+action.Reason]++
+			story.ActionCounts[action.ActionType+"__"+action.Reason]++
+		}
+
+		return nil
+	}); err != nil {
 		return errors.Wrap(err, "could not process comment actions")
 	}
 
 	logrus.Debug("finished writing out comment actions")
 
-	// Load all the action counts using our summer.
-	actionCountsFileName := filepath.Join(output, "commentActions.json")
-	actionCounts, err := pipeline.NewSummer(
-		pipeline.MergeTaskSummerOutputPipelines(
-			pipeline.FanSummerProcessor(
-				pipeline.NewJSONFileReader(actionCountsFileName),
-				ProcessActionCounts(),
-			),
-		),
-	)
-	if err != nil {
-		return errors.Wrap(err, "could not process action counts")
-	}
-
-	logrus.Debug("finished calculating comment action counts")
-
 	startedReconstructionAt := time.Now()
 	logrus.Debug("reconstructing families based on parent id map")
 
 	// Reconstruct all the family relationships from the parentID map.
-	reconstructor := common.NewReconstructor()
-	for commentID, parentIDs := range commentMap["parentID"] {
-		if len(parentIDs) == 1 {
-			reconstructor.AddIDs(commentID, parentIDs[0])
-		} else {
-			reconstructor.AddIDs(commentID, "")
-		}
+	re := common.NewReconstructor()
+	for commentID, comment := range comments {
+		re.AddIDs(commentID, comment.ParentID)
 	}
 
 	logrus.WithField("took", time.Since(startedReconstructionAt).String()).Debug("finished family reconstruction")
 
-	// Delete the reference to the parentID map that we don't need any more.
-	delete(commentMap, "parentID")
-
 	// Load all the comments in from the comments.json file.
-	if err := pipeline.NewFileWriter(
-		output,
-		pipeline.MergeTaskWriterOutputPipelines(
-			pipeline.FanWritingProcessors(
-				pipeline.NewJSONFileReader(commentsFileName),
-				ProcessComments(tenantID, siteID, actionCounts, reconstructor),
-			),
-		),
-	); err != nil {
-		return errors.Wrap(err, "could not process comments")
-	}
-
-	// Load all the comment statuses by reading the comments.json file again.
-	statusCounts, err := pipeline.NewSummer(
-		pipeline.MergeTaskSummerOutputPipelines(
-			pipeline.FanSummerProcessor(
-				pipeline.NewJSONFileReader(commentsFileName),
-				ProcessCommentStatusMap(),
-			),
-		),
-	)
+	commentsOutputFilename := filepath.Join(output, "comments.json")
+	commentsWriter, err := utility.NewJSONWriter(commentsOutputFilename)
 	if err != nil {
-		return errors.Wrap(err, "could not process status counts")
+		return errors.Wrap(err, "could not create comments writer")
+	}
+	defer commentsWriter.Close()
+
+	users := make(map[string]*UserRef)
+	if err := utility.ReadJSON(commentsFileName, func(line int, data []byte) error {
+		// Parse the Comment from the file.
+		var in Comment
+		if err := easyjson.Unmarshal(data, &in); err != nil {
+			logrus.WithField("line", line).Error(err)
+
+			return errors.Wrap(err, "could not parse an comment")
+		}
+
+		// Check the input to ensure we're validated.
+		if err := common.Check(&in); err != nil {
+			return errors.Wrap(err, "checking failed input Action")
+		}
+
+		comment := TranslateComment(tenantID, siteID, &in)
+
+		ref, ok := comments[comment.ID]
+		if !ok {
+			return errors.New("could not find comment ref")
+		}
+
+		// Associate the action count data.
+		comment.ActionCounts = ref.ActionCounts
+		if comment.DeletedAt == nil {
+			comment.Revisions[len(comment.Revisions)-1].ActionCounts = ref.ActionCounts
+		}
+
+		// Add reconstructed data.
+		comment.ChildIDs = re.GetChildren(comment.ID)
+		comment.ChildCount = len(comment.ChildIDs)
+		comment.AncestorIDs = re.GetAncestors(comment.ID)
+
+		user, ok := users[comment.AuthorID]
+		if !ok {
+			user = &UserRef{}
+			users[comment.AuthorID] = user
+		}
+		user.StatusCounts.Increment(comment.Status, 1)
+
+		story, ok := stories[ref.StoryID]
+		if !ok {
+			story = &StoryRef{
+				ActionCounts: map[string]int{},
+			}
+			stories[ref.StoryID] = story
+		}
+		story.StatusCounts.Increment(comment.Status, 1)
+
+		if err := commentsWriter.Write(comment); err != nil {
+			return errors.Wrap(err, "couldn't write out comment")
+		}
+
+		return nil
+	}); err != nil {
+		return errors.Wrap(err, "could not read comments json")
 	}
 
 	// Walk across all the comment's status maps so we can determine how many
 	// comments should be in the reported queue in each story.
 	reportedMap := make(map[string]int)
-	for commentID, statues := range commentMap["status"] {
-		if len(statues) != 1 {
-			continue
-		}
-
-		if statues[0] != "NONE" {
+	for _, comment := range comments {
+		if comment.Status != "NONE" {
 			// If the status is not none, then it can't be reported!
 			continue
 		}
 
-		commentActionCounts, ok := actionCounts[commentID]
-		if !ok {
-			// The comment didn't have any action counts, so it can't be
-			// flagged, so keep going!
-			continue
-		}
-
-		flagCount := commentActionCounts["FLAG"]
+		flagCount := comment.ActionCounts["FLAG"]
 		if flagCount > 0 {
-			// Get this comment's story ID.
-			storyIDs := commentMap["storyID"][commentID]
-			if len(storyIDs) != 1 {
-				continue
-			}
-
 			// Increment the storyID.
-			reportedMap[storyIDs[0]]++
+			reportedMap[comment.StoryID]++
 		}
 	}
 
 	// Process the stories now.
+	storiesOutputFilename := filepath.Join(output, "stories.json")
+	storiesWriter, err := utility.NewJSONWriter(storiesOutputFilename)
+	if err != nil {
+		return errors.Wrap(err, "could not create stories writer")
+	}
+	defer storiesWriter.Close()
+
 	assetsFileName := filepath.Join(input, "assets.json")
-	if err := pipeline.NewFileWriter(
-		output,
-		pipeline.MergeTaskWriterOutputPipelines(
-			pipeline.FanWritingProcessors(
-				pipeline.NewJSONFileReader(assetsFileName),
-				ProcessStories(tenantID, siteID, statusCounts, actionCounts, reportedMap),
-			),
-		),
-	); err != nil {
-		return errors.Wrap(err, "could not process stories")
-	}
-
-	// Write out all the users to ${output}/users.json.
-	usersFileName := filepath.Join(input, "users.json")
-	if err := pipeline.NewFileWriter(
-		output,
-		pipeline.MergeTaskWriterOutputPipelines(
-			pipeline.FanWritingProcessors(
-				pipeline.NewJSONFileReader(usersFileName),
-				ProcessUsers(tenantID, statusCounts),
-			),
-		),
-	); err != nil {
-		return errors.Wrap(err, "could not process users")
-	}
-
-	// Mark when we finished.
-	finished := time.Now()
-	logrus.WithField("took", finished.Sub(started).String()).Info("finished processing")
-
-	return nil
-}
-
-func ProcessUsers(tenantID string, statusCounts map[string]map[string]int) pipeline.WritingProcessor {
-	return func(write pipeline.CollectionWriter, n *pipeline.TaskReaderInput) error {
-		// Parse the user from the file.
-		var in User
-		if err := easyjson.Unmarshal([]byte(n.Input), &in); err != nil {
-			logrus.WithField("line", n.Line).Error(err)
-
-			return errors.Wrap(err, "could not parse an user")
-		}
-
-		user := TranslateUser(tenantID, &in)
-
-		// Get the status counts for this story.
-		userStatusCounts := statusCounts["user:"+user.ID]
-		user.CommentCounts.Status.Approved = userStatusCounts["APPROVED"]
-		user.CommentCounts.Status.None = userStatusCounts["NONE"]
-		user.CommentCounts.Status.Premod = userStatusCounts["PREMOD"]
-		user.CommentCounts.Status.Rejected = userStatusCounts["REJECTED"]
-		user.CommentCounts.Status.SystemWithheld = userStatusCounts["SYSTEM_WITHHELD"]
-
-		if err := write("users", user); err != nil {
-			return errors.Wrap(err, "couldn't write out user")
-		}
-
-		return nil
-	}
-}
-
-func ProcessStories(tenantID, siteID string, statusCounts, actionCounts map[string]map[string]int, reportedMap map[string]int) pipeline.WritingProcessor {
-	return func(write pipeline.CollectionWriter, n *pipeline.TaskReaderInput) error {
+	if err := utility.ReadJSON(assetsFileName, func(line int, data []byte) error {
 		// Parse the asset from the file.
 		var in Asset
-		if err := easyjson.Unmarshal([]byte(n.Input), &in); err != nil {
-			logrus.WithField("line", n.Line).Error(err)
+		if err := easyjson.Unmarshal(data, &in); err != nil {
+			logrus.WithField("line", line).Error(err)
 
 			return errors.Wrap(err, "could not parse an asset")
 		}
@@ -271,19 +301,12 @@ func ProcessStories(tenantID, siteID string, statusCounts, actionCounts map[stri
 		story := TranslateAsset(tenantID, siteID, &in)
 
 		// Get the status counts for this story.
-		storyStatusCounts := statusCounts["story:"+story.ID]
-		story.CommentCounts.Status.Approved = storyStatusCounts["APPROVED"]
-		story.CommentCounts.Status.None = storyStatusCounts["NONE"]
-		story.CommentCounts.Status.Premod = storyStatusCounts["PREMOD"]
-		story.CommentCounts.Status.Rejected = storyStatusCounts["REJECTED"]
-		story.CommentCounts.Status.SystemWithheld = storyStatusCounts["SYSTEM_WITHHELD"]
+		ref := stories[story.ID]
+
+		story.CommentCounts.Status = ref.StatusCounts
 
 		// Get the action counts for this story.
-		storyActionCounts := actionCounts[story.ID]
-		if storyActionCounts == nil {
-			storyActionCounts = map[string]int{}
-		}
-		story.CommentCounts.Action = storyActionCounts
+		story.CommentCounts.Action = ref.ActionCounts
 
 		// Begin updating the story's moderation queue counts.
 		story.CommentCounts.ModerationQueue.Total += story.CommentCounts.Status.None
@@ -299,164 +322,52 @@ func ProcessStories(tenantID, siteID string, statusCounts, actionCounts map[stri
 		story.CommentCounts.ModerationQueue.Total += reportedMap[story.ID]
 		story.CommentCounts.ModerationQueue.Queues.Reported += reportedMap[story.ID]
 
-		if err := write("stories", story); err != nil {
+		if err := storiesWriter.Write(story); err != nil {
 			return errors.Wrap(err, "couldn't write out story")
 		}
 
 		return nil
+	}); err != nil {
+		return errors.Wrap(err, "could not process stories")
 	}
-}
 
-func ProcessCommentStatusMap() pipeline.SummerProcessor {
-	return func(writer pipeline.SummerWriter, n *pipeline.TaskReaderInput) error {
-		// Parse the comment from the file.
-		var in Comment
-		if err := easyjson.Unmarshal([]byte(n.Input), &in); err != nil {
-			logrus.WithField("line", n.Line).Error(err)
-
-			return errors.Wrap(err, "could not parse an comment")
-		}
-
-		// Get the comment status, translated.
-		status := TranslateCommentStatus(in.Status)
-
-		// Add the status to the map referencing the story id.
-		writer("story:"+in.AssetID, status, 1)
-
-		// Add the status to the map referencing the user id.
-		writer("user:"+in.AuthorID, status, 1)
-
-		return nil
+	// Write out all the users to ${output}/users.json.
+	usersOutputFilename := filepath.Join(output, "users.json")
+	usersWriter, err := utility.NewJSONWriter(usersOutputFilename)
+	if err != nil {
+		return errors.Wrap(err, "could not create users writer")
 	}
-}
+	defer usersWriter.Close()
 
-func ProcessComments(tenantID, siteID string, actionCounts map[string]map[string]int, r *common.Reconstructor) pipeline.WritingProcessor {
-	return func(write pipeline.CollectionWriter, n *pipeline.TaskReaderInput) error {
-		// Parse the Comment from the file.
-		var in Comment
-		if err := easyjson.Unmarshal([]byte(n.Input), &in); err != nil {
-			logrus.WithField("line", n.Line).Error(err)
+	usersFileName := filepath.Join(input, "users.json")
+	if err := utility.ReadJSON(usersFileName, func(line int, data []byte) error {
+		// Parse the user from the file.
+		var in User
+		if err := easyjson.Unmarshal(data, &in); err != nil {
+			logrus.WithField("line", line).Error(err)
 
-			return errors.Wrap(err, "could not parse an comment")
+			return errors.Wrap(err, "could not parse an user")
 		}
 
-		// Check the input to ensure we're validated.
-		if err := common.Check(&in); err != nil {
-			return errors.Wrap(err, "checking failed input Action")
-		}
+		user := TranslateUser(tenantID, &in)
 
-		comment := TranslateComment(tenantID, siteID, &in)
+		// Get the status counts for this story.
+		ref := users[user.ID]
 
-		commentActionCounts, ok := actionCounts[comment.ID]
-		if !ok {
-			commentActionCounts = map[string]int{}
-		}
+		user.CommentCounts.Status = ref.StatusCounts
 
-		// Associate the action count data.
-		comment.ActionCounts = commentActionCounts
-		if comment.DeletedAt == nil {
-			comment.Revisions[len(comment.Revisions)-1].ActionCounts = commentActionCounts
-		}
-
-		// Add reconstructed data.
-		comment.ChildIDs = r.GetChildren(comment.ID)
-		comment.ChildCount = len(comment.ChildIDs)
-		comment.AncestorIDs = r.GetAncestors(comment.ID)
-
-		if err := write("comments", comment); err != nil {
-			return errors.Wrap(err, "couldn't write out comment")
+		if err := usersWriter.Write(user); err != nil {
+			return errors.Wrap(err, "couldn't write out user")
 		}
 
 		return nil
+	}); err != nil {
+		return errors.Wrap(err, "could not process users")
 	}
-}
 
-func ProcessActionCounts() pipeline.SummerProcessor {
-	return func(writer pipeline.SummerWriter, n *pipeline.TaskReaderInput) error {
-		// Parse the comment actions.
-		var in coral.CommentAction
-		if err := easyjson.Unmarshal([]byte(n.Input), &in); err != nil {
-			logrus.WithField("line", n.Line).Error(err)
+	// Mark when we finished.
+	finished := time.Now()
+	logrus.WithField("took", finished.Sub(started).String()).Info("finished processing")
 
-			return errors.Wrap(err, "could not parse an action")
-		}
-
-		// Write out the sums for this particular comment action.
-		writer(in.CommentID, in.ActionType, 1)
-		writer(in.StoryID, in.ActionType, 1)
-		if in.ActionType == "FLAG" {
-			writer(in.CommentID, in.ActionType+"__"+in.Reason, 1)
-			writer(in.StoryID, in.ActionType+"__"+in.Reason, 1)
-		}
-
-		return nil
-	}
-}
-
-func ProcessCommentMap() pipeline.AggregatingProcessor {
-	return func(writer pipeline.AggregationWriter, input *pipeline.TaskReaderInput) error {
-		// Parse the comment from the file.
-		var in Comment
-		if err := easyjson.Unmarshal([]byte(input.Input), &in); err != nil {
-			logrus.WithField("line", input.Line).Error(err)
-
-			return errors.Wrap(err, "could not parse a comment")
-		}
-
-		// Check the input to ensure we're validated.
-		if err := common.Check(&in); err != nil {
-			logrus.WithError(err).WithField("line", input.Line).Warn("validation failed for input user")
-
-			return nil
-		}
-
-		// Write the comment story ID out to the map.
-		writer("status", in.ID, TranslateCommentStatus(in.Status))
-		writer("storyID", in.ID, in.AssetID)
-		if in.ParentID != nil {
-			writer("parentID", in.ID, *in.ParentID)
-		} else {
-			writer("parentID", in.ID, "")
-		}
-
-		return nil
-	}
-}
-
-func ProcessCommentActions(tenantID, siteID string, comments map[string][]string) pipeline.WritingProcessor {
-	return func(write pipeline.CollectionWriter, input *pipeline.TaskReaderInput) error {
-		// Parse the Action from the file.
-		var in Action
-		if err := easyjson.Unmarshal([]byte(input.Input), &in); err != nil {
-			logrus.WithField("line", input.Line).Error(err)
-
-			return errors.Wrap(err, "could not parse an action")
-		}
-
-		// Ignore the action if it's not a comment action.
-		if in.ItemType != "COMMENTS" {
-			logrus.WithField("line", input.Line).Warn("skipping non-comment flag")
-
-			return nil
-		}
-
-		// Check the input to ensure we're validated.
-		if err := common.Check(&in); err != nil {
-			return errors.Wrap(err, "checking failed input Action")
-		}
-
-		// Translate the action to a comment action.
-		action := TranslateCommentAction(tenantID, siteID, &in)
-		storyID, ok := comments[action.CommentID]
-		if !ok || len(storyID) != 1 {
-			return nil
-		}
-		action.StoryID = storyID[0]
-
-		if err := write("commentActions", action); err != nil {
-			return errors.Wrap(err, "couldn't write out commentAction")
-		}
-
-		return nil
-	}
+	return nil
 }
