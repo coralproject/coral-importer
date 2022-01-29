@@ -7,6 +7,7 @@ import (
 
 	"github.com/mailru/easyjson"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 func NewJSONWriter(fileName string) (*JSONWriter, error) {
@@ -18,14 +19,17 @@ func NewJSONWriter(fileName string) (*JSONWriter, error) {
 	w := bufio.NewWriter(f)
 
 	return &JSONWriter{
-		f: f,
-		w: w,
+		f:        f,
+		w:        w,
+		filename: fileName,
 	}, nil
 }
 
 type JSONWriter struct {
-	f *os.File
-	w *bufio.Writer
+	f         *os.File
+	w         *bufio.Writer
+	documents uint64
+	filename  string
 }
 
 func (c *JSONWriter) Write(doc easyjson.Marshaler) error {
@@ -36,6 +40,8 @@ func (c *JSONWriter) Write(doc easyjson.Marshaler) error {
 	if _, err := c.w.WriteString("\n"); err != nil {
 		return errors.Wrap(err, "could not write newline")
 	}
+
+	c.documents++
 
 	return nil
 }
@@ -48,6 +54,8 @@ func (c *JSONWriter) Close() error {
 	if err := c.f.Close(); err != nil {
 		return errors.Wrap(err, "could not close file")
 	}
+
+	logrus.WithField("documents", c.documents).WithField("fileName", c.filename).Info("wrote documents")
 
 	return nil
 }
